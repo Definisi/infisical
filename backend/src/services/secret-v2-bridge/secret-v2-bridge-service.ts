@@ -32,7 +32,8 @@ import {
 } from "@app/ee/services/secret-approval-request/secret-approval-request-types";
 import { scanSecretPolicyViolations } from "@app/ee/services/secret-scanning-v2/secret-scanning-v2-fns";
 import { TSecretSnapshotServiceFactory } from "@app/ee/services/secret-snapshot/secret-snapshot-service";
-import { TKeyStoreFactory } from "@app/keystore/keystore";
+import { KeyStorePrefixes, TKeyStoreFactory } from "@app/keystore/keystore";
+import { generateCacheKeyFromData } from "@app/lib/crypto/cache";
 import { DatabaseErrorCode } from "@app/lib/error-codes";
 import { BadRequestError, ForbiddenRequestError, NotFoundError } from "@app/lib/errors";
 import { diff, groupBy } from "@app/lib/fn";
@@ -133,9 +134,14 @@ type TSecretV2BridgeServiceFactoryDep = {
   >;
   snapshotService: Pick<TSecretSnapshotServiceFactory, "performSnapshot">;
   resourceMetadataDAL: Pick<TResourceMetadataDALFactory, "insertMany" | "delete">;
-  keyStore: Pick<TKeyStoreFactory, "getItem" | "setExpiry" | "setItemWithExpiry" | "deleteItem" | "pgGetIntItem">;
+  keyStore: Pick<
+    TKeyStoreFactory,
+    "getItem" | "setExpiry" | "setItemWithExpiry" | "deleteItem" | "pgGetIntItem" | "hashGet" | "hashSet"
+  >;
   reminderService: Pick<TReminderServiceFactory, "createReminder" | "getReminder">;
 };
+
+const ETAG_TTL = 900; // 15 minutes in seconds
 
 export type TSecretV2BridgeServiceFactory = ReturnType<typeof secretV2BridgeServiceFactory>;
 
@@ -1120,8 +1126,21 @@ export const secretV2BridgeServiceFactory = ({
       expandPersonalOverrides,
       personalOverridesBehavior,
       throwOnMissingReadValuePermission = true,
+      ifNoneMatch,
       ...params
     } = dto;
+
+    // ETag/304 short-circuit: check Redis for stored ETag before expensive permission/KMS/cache work
+    const etagRedisKey = KeyStorePrefixes.SecretEtag(projectId);
+    const etagField = `${actorId}:${generateCacheKeyFromData(params)}`;
+
+    if (ifNoneMatch) {
+      const storedEtag = await keyStore.hashGet(etagRedisKey, etagField);
+      if (storedEtag && storedEtag === ifNoneMatch) {
+        return { notModified: true, etag: ifNoneMatch, secrets: [], imports: [] };
+      }
+    }
+
     const { permission } = await permissionService.getProjectPermission({
       actor,
       actorId,
@@ -1159,7 +1178,7 @@ export const secretV2BridgeServiceFactory = ({
           secrets: typeof decryptedSecrets;
           imports: typeof importedSecrets;
         };
-        return {
+        const payload = {
           secrets: secrets.map((el) => ({
             ...el,
             createdAt: new Date(el.createdAt),
@@ -1167,6 +1186,10 @@ export const secretV2BridgeServiceFactory = ({
           })),
           imports
         };
+        const cachedEtag = `W/"${generateCacheKeyFromData(payload)}"`;
+        await keyStore.hashSet(etagRedisKey, etagField, cachedEtag);
+        await keyStore.setExpiry(etagRedisKey, ETAG_TTL);
+        return { ...payload, etag: cachedEtag };
       } catch (err) {
         logger.error(err, "Secret service layer cache miss");
         await keyStore.deleteItem(cacheKey);
@@ -1414,7 +1437,10 @@ export const secretV2BridgeServiceFactory = ({
       if (encryptedUpdatedCachedSecrets.byteLength < MAX_SECRET_CACHE_BYTES) {
         await keyStore.setItemWithExpiry(cacheKey, SECRET_DAL_TTL(), encryptedUpdatedCachedSecrets.toString("base64"));
       }
-      return payload;
+      const computedEtag = `W/"${generateCacheKeyFromData(payload)}"`;
+      await keyStore.hashSet(etagRedisKey, etagField, computedEtag);
+      await keyStore.setExpiry(etagRedisKey, ETAG_TTL);
+      return { ...payload, etag: computedEtag };
     }
 
     const secretImports = await secretImportDAL.findByFolderIds(paths.map((p) => p.folderId));
@@ -1483,7 +1509,10 @@ export const secretV2BridgeServiceFactory = ({
     if (encryptedUpdatedCachedSecrets.byteLength < MAX_SECRET_CACHE_BYTES) {
       await keyStore.setItemWithExpiry(cacheKey, SECRET_DAL_TTL(), encryptedUpdatedCachedSecrets.toString("base64"));
     }
-    return payload;
+    const computedEtag = `W/"${generateCacheKeyFromData(payload)}"`;
+    await keyStore.hashSet(etagRedisKey, etagField, computedEtag);
+    await keyStore.setExpiry(etagRedisKey, ETAG_TTL);
+    return { ...payload, etag: computedEtag };
   };
 
   const getSecretById = async ({ actorId, actor, actorOrgId, actorAuthMethod, secretId }: TGetASecretByIdDTO) => {
